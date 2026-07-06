@@ -1,4 +1,5 @@
 use std::{ops::{Add, Sub}, sync::Arc};
+use cosmic_text::skrifa::font;
 use pollster::FutureExt;
 use ropey::Rope;
 use wgpu::{InstanceDescriptor, MultisampleState, wgt::TextureViewDescriptor};
@@ -35,6 +36,8 @@ struct App{
     cursor:         Option<Cursor>,
     font_engine:    Option<FontEngine>,
     text:           ropey::Rope,
+    control:        bool,
+    scroll_line_offset: usize,
 
 }
 impl App{
@@ -79,7 +82,14 @@ impl App{
     }
 
     fn create_font_engine(gpu: &GPU) -> FontEngine {
-        let font_system = glyphon::FontSystem::new();
+        let mut db = glyphon::fontdb::Database::new();
+        db.load_system_fonts();
+
+        let font_data = include_bytes!("FiraCode.ttf");
+        db.load_font_data(font_data.to_vec());
+
+        db.set_monospace_family("Fira Code");
+        let font_system = glyphon::FontSystem::new_with_locale_and_db("en-US".into(), db);
         let cache = glyphon::Cache::new(&gpu.device);
         let mut viewport = glyphon::Viewport::new(&gpu.device, &cache);
         viewport.update(&gpu.queue, glyphon::Resolution { width: gpu.config.width, height: gpu.config.height });
@@ -102,7 +112,7 @@ impl App{
         let mut buffer = glyphon::Buffer::new(&mut font_engine.font_system, glyphon::Metrics { font_size: 16.0, line_height: 20.0 });
         let size = window.inner_size();
         buffer.set_size(&mut font_engine.font_system, Some(size.width as f32), Some(size.height as f32));
-        buffer.set_text(&mut font_engine.font_system, start_text, &glyphon::Attrs::new().family(glyphon::Family::SansSerif), glyphon::Shaping::Advanced, None);
+        buffer.set_text(&mut font_engine.font_system, start_text, &glyphon::Attrs::new().family(glyphon::Family::Monospace), glyphon::Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut font_engine.font_system, false);
         buffer
     }
@@ -149,7 +159,51 @@ impl App{
 
     fn set_text(&mut self, text:String){
         self.text.insert(0, &text);
-        self.text_buffer.as_mut().unwrap().set_text(&mut self.font_engine.as_mut().unwrap().font_system, &text, &glyphon::Attrs::new().family(glyphon::Family::SansSerif), glyphon::Shaping::Advanced, None);
+        self.text_buffer.as_mut().unwrap().set_text(&mut self.font_engine.as_mut().unwrap().font_system, &text, &glyphon::Attrs::new().family(glyphon::Family::Monospace), glyphon::Shaping::Advanced, None);
+    }
+
+    fn calculate_ctrl_backspace_target(text: &ropey::Rope, current_pos: usize)->usize{
+        if current_pos == 0{
+            return 0
+        }
+        let mut chars = text.chars_at(current_pos);
+        let mut new_pos = current_pos;
+
+        let mut found_non_whitespace = false;
+        let mut is_alphanumeric_word = false;
+
+        while let Some(c) = chars.prev(){
+            if !found_non_whitespace{
+                if c.is_whitespace(){
+                    new_pos -=1;
+                    continue;
+                }
+                
+                found_non_whitespace = true;
+                is_alphanumeric_word = c.is_alphanumeric();
+                new_pos -= 1;
+                continue;
+
+            }
+
+            if is_alphanumeric_word{
+                if c.is_alphanumeric(){
+                    new_pos-=1;
+                }
+                else {
+                    break;
+                }
+            }else {
+                if !c.is_alphanumeric() && !c.is_whitespace(){
+                    new_pos-=1;
+                }
+                else{
+                    break;
+                }
+            }
+        }
+        new_pos
+        
     }
 }
 
@@ -172,7 +226,7 @@ impl ApplicationHandler for App {
             let cursor_position = self.text.len_chars();
             let mut cursor_buffer = glyphon::Buffer::new(&mut self.font_engine.as_mut().unwrap().font_system, glyphon::Metrics { font_size: 16.0, line_height: 20.0 });
             
-            cursor_buffer.set_text(&mut self.font_engine.as_mut().unwrap().font_system, "|", &glyphon::Attrs::new().family(glyphon::Family::SansSerif), glyphon::Shaping::Advanced, None);
+            cursor_buffer.set_text(&mut self.font_engine.as_mut().unwrap().font_system, "|", &glyphon::Attrs::new().family(glyphon::Family::Monospace), glyphon::Shaping::Advanced, None);
             self.cursor = Some(Cursor { buffer: cursor_buffer, screen_position_x: 0.0, screen_position_y: 0.0, text_position: cursor_position });
         }
         
@@ -229,7 +283,7 @@ impl ApplicationHandler for App {
                             glyphon::TextArea { 
                                 buffer: &cursor.buffer, 
                                 left: 10.0 + pos_x - 3.0, 
-                                top: pos_y + 8.0, 
+                                top: pos_y + 10.0, 
                                 scale: 1.0,
                                 bounds: glyphon::TextBounds { left: 0, top: 0, right: 60000, bottom: 60000 }, 
                                 default_color: glyphon::Color::rgba(255, 0, 255, 255), 
@@ -278,6 +332,17 @@ impl ApplicationHandler for App {
                 gpu.config.height = size.height;
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 self.font_engine.as_mut().unwrap().viewport.update(&gpu.queue, glyphon::Resolution { width: size.width, height: size.height });
+
+                // Update the text buffer's physical boundaries so it knows where to word-wrap
+                if let Some(text_buffer) = self.text_buffer.as_mut() {
+                    text_buffer.set_size(
+                        &mut self.font_engine.as_mut().unwrap().font_system, 
+                        Some(size.width as f32), 
+                        Some(size.height as f32)
+                    );
+                    // Force the CPU to recalculate the line breaks based on the new size
+                    text_buffer.shape_until_scroll(&mut self.font_engine.as_mut().unwrap().font_system, false);
+                }
                 self.window.as_ref().unwrap().request_redraw();
             },
             WindowEvent::KeyboardInput { event,.. } => {  
@@ -299,10 +364,15 @@ impl ApplicationHandler for App {
                             text_changed = true;
                         }
                         Key::Named(winit::keyboard::NamedKey::Backspace) =>{
-                            if cursor.text_position > 0{
-                                self.text.remove((cursor.text_position-1)..cursor.text_position);
-                                cursor.text_position = cursor.text_position.sub(1);
-                            }
+                            if cursor.text_position <= 0{return}
+                            let target_pos = if self.control{
+                                Self::calculate_ctrl_backspace_target(&self.text, cursor.text_position)
+                            }else{
+                                cursor.text_position.saturating_sub(1)
+                            };
+
+                            self.text.remove(target_pos..cursor.text_position);
+                            cursor.text_position = target_pos;
                             text_changed = true;
                         }
                         Key::Named(winit::keyboard::NamedKey::Enter) => {
@@ -327,17 +397,35 @@ impl ApplicationHandler for App {
                             cursor.text_position = new_pos.clamp(cursor.text_position, self.text.len_chars()); 
                             self.window.as_ref().unwrap().request_redraw();
                         }
+                        Key::Named(winit::keyboard::NamedKey::Control) =>{
+                            self.control = true;
+                        },
+                        Key::Named(winit::keyboard::NamedKey::Tab) =>{
+                             let c = "\t";
+                            self.text.insert(cursor.text_position, c);
+          
+                            cursor.text_position = cursor.text_position.add(1);
+                            text_changed = true;
+                        }
                         _ =>{}
                     }
-
+                    
                     if text_changed{
                             let text_buffer = self.text_buffer.as_mut().unwrap();
-                            text_buffer.set_text(&mut self.font_engine.as_mut().unwrap().font_system, &self.text.to_string(), &glyphon::Attrs::new().family(glyphon::Family::SansSerif), glyphon::Shaping::Advanced, None);
+                            text_buffer.set_text(&mut self.font_engine.as_mut().unwrap().font_system, &self.text.to_string(), &glyphon::Attrs::new().family(glyphon::Family::Monospace), glyphon::Shaping::Advanced, None);
                             text_buffer.shape_until_scroll(&mut self.font_engine.as_mut().unwrap().font_system, false);
                             self.window.as_ref().unwrap().request_redraw();
                     }
   
+                }else if event.state == winit::event::ElementState::Released{
+                    match event.logical_key.as_ref(){
+                        Key::Named(winit::keyboard::NamedKey::Control) => {
+                            self.control = false;
+                        },
+                        _ => {}
+                    } 
                 }
+
                 
             }
             _ => {}
@@ -349,11 +437,7 @@ impl ApplicationHandler for App {
 
 fn generate_big_text_file() -> String{
     let mut text = String::new();
-
-    for _ in 0..1_000_000{
-        text.push('a');
-    }
-
+    text.push_str("Hello Fucker!");
     text
 }
 
